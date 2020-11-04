@@ -30,7 +30,7 @@ def benchmark_aev(parser, dataset, aev_comp):
 
     total_time = (stop - start) / parser.num_epochs
     print('Time per epoch - {:.1f}s\n'.format(total_time))
-    return(aev_result)
+    return aev_result
 
 
 if __name__ == "__main__":
