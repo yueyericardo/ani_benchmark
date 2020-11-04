@@ -79,4 +79,4 @@ if __name__ == "__main__":
         assert cuaev_error < 1e-4, f'  cuaev Error: {cuaev_error:.1e}\n'
         nnpopsaev_error = torch.max(torch.abs(aev_nnpops - aev_ref))
         # print(f'  nnpops Error: {nnpopsaev_error:.1e}\n')
-        assert nnpopsaev_error < 1e-4, f'  cuaev Error: {nnpopsaev_error:.1e}\n'
+        assert nnpopsaev_error < 1e-4, f'  nnpops Error: {nnpopsaev_error:.1e}\n'
