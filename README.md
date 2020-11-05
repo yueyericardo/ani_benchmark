@@ -15,7 +15,7 @@ pip install -e .
 
 ### Benchmark
 ```
-pip install pkbar h5py
+pip install pkbar h5py pynvml
 ```
 ```
 python benchmark1.py 
