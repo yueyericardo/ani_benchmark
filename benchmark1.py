@@ -28,7 +28,8 @@ def info(text):
     print('\033[32m{}\33[0m'.format(text))  # green
 
 
-def benchmark(speciesPositions, aev_comp, N, check_gpu_mem):
+def benchmark(species, positions, aev_comp, N, check_gpu_mem, check_grad):
+    speciesPositions = nnp.species_converter((species, positions))
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.synchronize()
@@ -38,15 +39,23 @@ def benchmark(speciesPositions, aev_comp, N, check_gpu_mem):
         aev = aev_comp(speciesPositions).aevs
         if i == 2 and check_gpu_mem:
             checkgpu()
+        if check_grad:
+            sum_aev = torch.sum(aev)
+            if positions.grad is not None:
+                positions.grad.zero_()
+            sum_aev.backward()
+            grad = positions.grad.clone()
+        else:
+            grad = None
 
     torch.cuda.synchronize()
     delta = time.time() - start
     print(f'  Duration: {delta:.2f} s')
     print(f'  Speed: {delta/N*1000:.2f} ms/it')
-    return aev, delta
+    return aev, delta, grad
 
 
-def check_speedup_error(aev, aev_ref, speed, speed_ref):
+def check_speedup_error(aev, aev_ref, speed, speed_ref, grad=None, grad_ref=None):
     speedUP = speed_ref / speed
     if speedUP > 1:
         info(f'  Speed up: {speedUP:.2f} X\n')
@@ -54,7 +63,10 @@ def check_speedup_error(aev, aev_ref, speed, speed_ref):
         alert(f'  Speed up (slower): {speedUP:.2f} X\n')
 
     aev_error = torch.max(torch.abs(aev - aev_ref))
-    assert aev_error < 0.02, f'  Error: {aev_error:.1e}\n'
+    assert aev_error < 0.02, f'  AEV Error: {aev_error:.1e}\n'
+    if grad is not None and grad_ref is not None:
+        grad_error = torch.max(torch.abs(grad - grad_ref))
+        assert grad_error < 0.02, f'  Grad Error: {grad_error:.1e}\n'
 
 
 if __name__ == "__main__":
@@ -62,38 +74,45 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--nnpops_cu_out',
                         default=None)
-    parser.add_argument('-c', '--check_gpu_mem',
+    parser.add_argument('-m', '--check_gpu_mem',
                         dest='check_gpu_mem',
                         action='store_const',
                         const=1)
+    parser.add_argument('-g', '--check_grad',
+                        dest='check_grad',
+                        action='store_const',
+                        const=1)
     parser.set_defaults(check_gpu_mem=0)
+    parser.set_defaults(check_grad=0)
     parser = parser.parse_args()
 
     check_gpu_mem = parser.check_gpu_mem
+    check_grad = True if parser.check_grad else False
+    print(f'Check Gradient: {check_grad}')
+
     device = torch.device('cuda')
     # files = ['2iuz_ligand.mol2', '1hvk_ligand.mol2', '2iuz_ligand.mol2', '3hkw_ligand.mol2', '3hky_ligand.mol2', '3lka_ligand.mol2', '3o99_ligand.mol2', 'small.pdb', '1hz5.pdb', '6W8H.pdb']
-    files = ['small.pdb', '1hz5.pdb', '6W8H.pdb']
+    files = ['2iuz_ligand.mol2', 'small.pdb', '1hz5.pdb', '6W8H.pdb']
 
     for file in files:
         mol = mdtraj.load(f'molecules/{file}')
         species = torch.tensor([[atom.element.atomic_number for atom in mol.top.atoms]], device=device)
-        positions = torch.tensor(mol.xyz * 10, dtype=torch.float32, requires_grad=False, device=device)
+        positions = torch.tensor(mol.xyz * 10, dtype=torch.float32, requires_grad=check_grad, device=device)
         print(f'File: {file}, Molecule size: {species.shape[-1]}\n')
 
         nnp = torchani.models.ANI2x(periodic_table_index=True, model_index=None).to(device)
-        speciesPositions = nnp.species_converter((species, positions))
         symmFuncRef = nnp.aev_computer
         symmFunc = TorchANISymmetryFunctions(nnp.aev_computer).to(device)
 
         N = 100
 
         print('Original TorchANI:')
-        aev_ref, delta_ref = benchmark(speciesPositions, symmFuncRef, N, check_gpu_mem)
+        aev_ref, delta_ref, grad_ref = benchmark(species, positions, symmFuncRef, N, check_gpu_mem, check_grad)
         print()
 
         print('NNPops:')
-        aev, delta = benchmark(speciesPositions, symmFunc, N, check_gpu_mem)
-        check_speedup_error(aev, aev_ref, delta, delta_ref)
+        aev, delta, grad = benchmark(species, positions, symmFunc, N, check_gpu_mem, check_grad)
+        check_speedup_error(aev, aev_ref, delta, delta_ref, grad, grad_ref)
 
         if parser.nnpops_cu_out and file.endswith(".pdb"):
             print('NNPops (C++ directly):')
@@ -101,10 +120,11 @@ if __name__ == "__main__":
             subprocess.run(commands, shell=True, check=True, universal_newlines=True)
             print()
 
-        print('CUaev (Kamesh):')
-        nnp.aev_computer.use_cuda_extension = True
-        cuaev_computer = nnp.aev_computer
-        aev, delta = benchmark(speciesPositions, cuaev_computer, N, check_gpu_mem)
-        check_speedup_error(aev, aev_ref, delta, delta_ref)
+        if not check_grad:
+            print('CUaev (Kamesh):')
+            nnp.aev_computer.use_cuda_extension = True
+            cuaev_computer = nnp.aev_computer
+            aev, delta, grad = benchmark(species, positions, cuaev_computer, N, check_gpu_mem, check_grad=False)
+            check_speedup_error(aev, aev_ref, delta, delta_ref)
 
         print('-'*70 + '\n')
