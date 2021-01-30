@@ -86,9 +86,12 @@ def check_speedup_error(aev, aev_ref, speed, speed_ref, grad=None, grad_ref=None
         alert(f'  Speed up (slower): {speedUP:.2f} X\n')
 
     aev_error = torch.max(torch.abs(aev - aev_ref))
+    # print(torch.abs(aev - aev_ref).flatten().sort()[-20:])
+    print(f'  AEV Error: {aev_error:.1e} {aev.shape} {aev_ref.shape}\n')
     assert aev_error < 0.02, f'  AEV Error: {aev_error:.1e}\n'
     if grad is not None and grad_ref is not None:
         grad_error = torch.max(torch.abs(grad - grad_ref))
+        print(f'  Grad Error: {grad_error:.1e} {grad.shape} {grad_ref.shape}\n')
         assert grad_error < 0.02, f'  Grad Error: {grad_error:.1e}\n'
 
 
@@ -158,11 +161,11 @@ if __name__ == "__main__":
         aev, delta, grad = benchmark(species, positions, cell, pbc, symmFunc, N, check_gpu_mem, check_grad, check_energy)
         check_speedup_error(aev, aev_ref, delta, delta_ref, grad, grad_ref)
 
-        if (not pbc):
+        if (not parser.use_pbc):
             print('CUaev (Kamesh):')
             nnp.aev_computer.use_cuda_extension = True
             cuaev_computer = nnp.aev_computer
             aev, delta, grad = benchmark(species, positions, cell, pbc, cuaev_computer, N, check_gpu_mem, check_grad, check_energy)
-            check_speedup_error(aev, aev_ref, delta, delta_ref)
+            check_speedup_error(aev, aev_ref, delta, delta_ref, grad, grad_ref)
 
         print('-' * 70 + '\n')
