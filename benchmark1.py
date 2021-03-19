@@ -4,19 +4,29 @@ import torchani
 import pynvml
 import gc
 import os
-import argparse
 from ase.io import read
+import argparse
 from NNPOps.SymmetryFunctions import TorchANISymmetryFunctions
+
+summary = '\n'
+runcounter = 0
+N = 200
+last_py_speed = None
 
 
 def checkgpu(device=None):
     i = device if device else torch.cuda.current_device()
+    t = torch.cuda.get_device_properties(i).total_memory
+    c = torch.cuda.memory_reserved(i)
+    name = torch.cuda.get_device_properties(i).name
+    print('   GPU Memory Cached (pytorch) : {:7.1f}MB / {:.1f}MB ({})'.format(c / 1024 / 1024, t / 1024 / 1024, name))
     real_i = int(os.environ['CUDA_VISIBLE_DEVICES'][0]) if 'CUDA_VISIBLE_DEVICES' in os.environ else i
     pynvml.nvmlInit()
     h = pynvml.nvmlDeviceGetHandleByIndex(real_i)
     info = pynvml.nvmlDeviceGetMemoryInfo(h)
     name = pynvml.nvmlDeviceGetName(h)
-    print('  GPU Memory Used (nvidia-smi): {:7.1f}MB / {:.1f}MB ({})'.format(info.used / 1024 / 1024, info.total / 1024 / 1024, name.decode()))
+    print('   GPU Memory Used (nvidia-smi): {:7.1f}MB / {:.1f}MB ({})'.format(info.used / 1024 / 1024, info.total / 1024 / 1024, name.decode()))
+    return f'{(info.used / 1024 / 1024):.1f}MB'
 
 
 def alert(text):
@@ -27,145 +37,230 @@ def info(text):
     print('\033[32m{}\33[0m'.format(text))  # green
 
 
-# @snoop()
-def benchmark(species, positions, cell, pbc, aev_comp, N, check_gpu_mem, check_grad, check_energy):
-    speciesPositions = nnp.species_converter((species, positions))
+def format_time(t):
+    if t < 1:
+        t = f'{t * 1000:.1f} ms'
+    else:
+        t = f'{t:.3f} sec'
+    return t
+
+
+def addSummaryLine(items=None, init=False):
+    if init:
+        addSummaryEmptyLine()
+        items = ['RUN', 'PDB', 'Size', 'forward', 'backward', 'Others', 'Total', f'Total({N})', 'Speedup', 'GPU']
+    global summary
+    summary += items[0].ljust(23) + items[1].ljust(13) + items[2].ljust(13) + items[3].ljust(13) + items[4].ljust(13) + items[5].ljust(13) + \
+        items[6].ljust(13) + items[7].ljust(13) + items[8].ljust(13) + items[9].ljust(13) + '\n'
+
+
+def addSummaryEmptyLine():
+    global summary
+    summary += f"{'-'*23}".ljust(23) + f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + \
+        f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + f"{'-'*13}".ljust(13) + '\n'
+
+
+def benchmark(speciesPositions, aev_comp, runbackward=False, mol_info=None, verbose=True):
+    global runcounter
+    global last_py_speed
+    mode = 'py'
+    if hasattr(aev_comp, 'use_cuda_extension'):
+        if aev_comp.use_cuda_extension:
+            mode = 'cu'
+        else:
+            mode = 'py'
+    else:
+        mode = 'nnpops'
+    mode_align = mode.ljust(6)
+    runname = f"{mode_align} aev fd{'+bd' if runbackward else''}"
+    items = [f'{(runcounter+1):02} {runname}', f"{mol_info['name']}", f"{mol_info['atoms']}", '-', '-', '-', '-', '-', '-', '-']
+
+    forward_time = 0
+    force_time = 0
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.synchronize()
-    if check_energy:
-        nnp1 = torchani.models.ANI2x(periodic_table_index=True, model_index=None).to(device)
-        nnp1.aev_computer = aev_comp
     start = time.time()
 
+    aev = None
+    force = None
+    gpumem = None
     for i in range(N):
-        if not check_energy:
-            aev = aev_comp(speciesPositions, cell, pbc).aevs
-            if i == 2 and check_gpu_mem:
-                checkgpu()
-            if check_grad:
-                sum_aev = torch.sum(aev)
-                if positions.grad is not None:
-                    positions.grad.zero_()
-                sum_aev.backward()
-                grad = positions.grad.clone()
-            else:
-                grad = None
-        else:
-            # TODO
-            # speciesPositions = nnp1.species_converter((species, positions))
-            species_aevs = aev_comp(speciesPositions, cell, pbc)
-            # aevs = []
-            # for nn in nnp1.neural_networks[5:8]:
-            #     aevs.append(nn(species_aevs)[1])
-            # aev = torch.cat(aevs, dim=0).sum(dim=0, keepdim=True)
-            aev = nnp1.neural_networks(species_aevs)[1]
-            if i == 2 and check_gpu_mem:
-                checkgpu()
-            if check_grad:
-                sum_aev = torch.sum(aev)
-                if positions.grad is not None:
-                    positions.grad.zero_()
-                sum_aev.backward()
-                grad = positions.grad.clone()
-            else:
-                grad = None
+        species, coordinates = speciesPositions
+        coordinates = coordinates.requires_grad_(runbackward)
+
+        torch.cuda.synchronize()
+        forward_start = time.time()
+        try:
+            _, aev = aev_comp((species, coordinates))
+        except Exception as e:
+            alert(f"  AEV faild: {str(e)[:50]}...")
+            addSummaryLine(items)
+            runcounter += 1
+            return None, None, None
+        torch.cuda.synchronize()
+        forward_time += time.time() - forward_start
+
+        if runbackward:  # backward
+            force_start = time.time()
+            try:
+                force = -torch.autograd.grad(aev.sum(), coordinates, create_graph=True, retain_graph=True)[0]
+            except Exception as e:
+                alert(f" Force faild: {str(e)[:50]}...")
+                addSummaryLine(items)
+                runcounter += 1
+                return None, None, None
+            torch.cuda.synchronize()
+            force_time += time.time() - force_start
+
+        if i == 2 and verbose:
+            gpumem = checkgpu()
 
     torch.cuda.synchronize()
-    delta = time.time() - start
-    # print(f'  Duration: {delta:.2f} s')
-    print(f'  Speed: {delta/N*1000:.2f} ms/it')
-    return aev, delta, grad
+    total_time = (time.time() - start) / N
+    force_time = force_time / N
+    forward_time = forward_time / N
+    others_time = total_time - force_time - forward_time
+
+    if verbose:
+        if mode != 'py':
+            if last_py_speed is not None:
+                speed_up = last_py_speed / total_time
+                speed_up = f'{speed_up:.2f}'
+            else:
+                speed_up = '-'
+        else:
+            last_py_speed = total_time
+            speed_up = '-'
+
+    if verbose:
+        print(f'  Duration: {total_time * N:.2f} s')
+        print(f'  Speed: {total_time*1000:.2f} ms/it')
+        if runcounter == 0:
+            addSummaryLine(init=True)
+            addSummaryEmptyLine()
+        if runcounter >= 0:
+            items = [f'{(runcounter+1):02} {runname}',
+                     f"{mol_info['name']}",
+                     f"{mol_info['atoms']}",
+                     f'{format_time(forward_time)}',
+                     f'{format_time(force_time)}',
+                     f'{format_time(others_time)}',
+                     f'{format_time(total_time)}',
+                     f'{format_time(total_time * N)}',
+                     f'{speed_up}',
+                     f'{gpumem}']
+            addSummaryLine(items)
+        runcounter += 1
+
+    return aev, total_time, force
 
 
-def check_speedup_error(aev, aev_ref, speed, speed_ref, grad=None, grad_ref=None):
-    speedUP = speed_ref / speed
-    if speedUP > 1:
-        info(f'  Speed up: {speedUP:.2f} X\n')
-    else:
-        alert(f'  Speed up (slower): {speedUP:.2f} X\n')
+def check_speedup_error(aev, aev_ref, speed, speed_ref, force, force_ref):
+    if (speed_ref is not None) and (speed is not None) and (aev is not None) and (aev_ref is not None):
+        speedUP = speed_ref / speed
+        if speedUP > 1:
+            info(f'  Speed up: {speedUP:.2f} X\n')
+        else:
+            alert(f'  Speed up (slower): {speedUP:.2f} X\n')
 
-    aev_error = torch.max(torch.abs(aev - aev_ref))
-    # print(torch.abs(aev - aev_ref).flatten().sort()[-20:])
-    print(f'  AEV Error: {aev_error:.1e} {aev.shape} {aev_ref.shape}\n')
-    assert aev_error < 0.02, f'  AEV Error: {aev_error:.1e}\n'
-    if grad is not None and grad_ref is not None:
-        grad_error = torch.max(torch.abs(grad - grad_ref))
-        print(f'  Grad Error: {grad_error:.1e} {grad.shape} {grad_ref.shape}\n')
-        assert grad_error < 0.02, f'  Grad Error: {grad_error:.1e}\n'
+        aev_error = torch.max(torch.abs(aev - aev_ref))
+        assert aev_error < 0.02, f'  Error: {aev_error:.1e}\n'
+
+    if (force is not None) and (force_ref is not None):
+        force_error = torch.max(torch.abs(force - force_ref))
+        assert force_error < 0.02, f'  Error: {force_error:.1e}\n'
+
+
+def run(file, nnp_ref, nnp_cuaev, nnpops_computer, runbackward, maxatoms=10000):
+    nnpops_computer = TorchANISymmetryFunctions(nnp_ref.aev_computer).to(device)
+    filepath = os.path.join(path, f'molecules/{file}')
+    mol = read(filepath)
+    species = torch.tensor([mol.get_atomic_numbers()], device=device)
+    positions = torch.tensor([mol.get_positions()], dtype=torch.float32, requires_grad=False, device=device)
+    spelist = list(torch.unique(species.flatten()).cpu().numpy())
+    species = species[:, :maxatoms]
+    positions = positions[:, :maxatoms, :]
+    speciesPositions = nnp_ref.species_converter((species, positions))
+    print(f'File: {file}, Molecule size: {species.shape[-1]}, Species: {spelist}\n')
+
+    if args.nsight:
+        torch.cuda.nvtx.range_push(file)
+
+    print('Original TorchANI:')
+    mol_info = {'name': file, 'atoms': species.shape[-1]}
+    aev_ref, delta_ref, force_ref = benchmark(speciesPositions, nnp_ref.aev_computer, runbackward, mol_info)
+    print()
+
+    print('CUaev:')
+    # warm up
+    _, _, _ = benchmark(speciesPositions, nnp_cuaev.aev_computer, runbackward, mol_info, verbose=False)
+    # run
+    aev, delta, force = benchmark(speciesPositions, nnp_cuaev.aev_computer, runbackward, mol_info)
+    check_speedup_error(aev, aev_ref, delta, delta_ref, force, force_ref)
+    print()
+
+    print('NNPops:')
+    # warm up
+    _, _, _ = benchmark(speciesPositions, nnpops_computer, runbackward, mol_info, verbose=False)
+    # run
+    aev, delta, force = benchmark(speciesPositions, nnpops_computer, runbackward, mol_info)
+    check_speedup_error(aev, aev_ref, delta, delta_ref, force, force_ref)
+
+    global last_py_speed
+    last_py_speed = None
+    if args.nsight:
+        torch.cuda.nvtx.range_pop()
+
+    print('-' * 70 + '\n')
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--nnpops_cu_out',
-                        default=None)
-    parser.add_argument('-m', '--check_gpu_mem',
-                        dest='check_gpu_mem',
-                        action='store_const',
-                        const=1)
-    parser.add_argument('-g', '--check_grad',
-                        dest='check_grad',
-                        action='store_const',
-                        const=1)
-    parser.add_argument('-e', '--check_energy',
-                        dest='check_energy',
-                        action='store_const',
-                        const=1)
-    parser.add_argument('-p', '--pbc',
-                        dest='use_pbc',
-                        action='store_const',
-                        const=1)
-    parser.set_defaults(check_gpu_mem=0)
-    parser.set_defaults(check_grad=0)
-    parser.set_defaults(use_pbc=0)
-    parser.set_defaults(check_energy=0)
-    parser = parser.parse_args()
-
-    check_gpu_mem = parser.check_gpu_mem
-    check_grad = True if parser.check_grad else False
-    check_energy = True if parser.check_energy else False
-    print(f'Check Gradient: {check_grad}')
+    parser.add_argument('-s', '--nsight',
+                        action='store_true',
+                        help='use nsight profile')
+    parser.add_argument('-b', '--backward',
+                        action='store_true',
+                        help='benchmark double backward')
+    parser.add_argument('-n', '--N',
+                        help='Number of Repeat',
+                        default=200, type=int)
+    parser.set_defaults(backward=0)
+    args = parser.parse_args()
+    path = os.path.dirname(os.path.realpath(__file__))
+    N = args.N
 
     device = torch.device('cuda')
-    # files = ['2iuz_ligand.mol2', '1hvk_ligand.mol2', '2iuz_ligand.mol2', '3hkw_ligand.mol2', '3hky_ligand.mol2', '3lka_ligand.mol2', '3o99_ligand.mol2', 'small.pdb', '1hz5.pdb', '6W8H.pdb']
-    files = ['small.pdb', '3NIR.pdb', '6W8H.pdb']
-    if (parser.use_pbc):
-        files = ['3NIR.pdb']
+    files = ['small.pdb', '6W8H.pdb']
+    # files = ['small.pdb']
+    nnp_ref = torchani.models.ANI2x(periodic_table_index=True, model_index=None).to(device)
+    nnp_cuaev = torchani.models.ANI2x(periodic_table_index=True, model_index=None).to(device)
+    nnp_cuaev.aev_computer.use_cuda_extension = True
+    nnpops_computer = None  # needed be initilize for every pdb
+
+    if args.nsight:
+        N = 3
+        torch.cuda.profiler.start()
 
     for file in files:
-        mol = read(f'molecules/{file}')
-        species = torch.tensor([mol.get_atomic_numbers()], device=device)
-        positions = torch.tensor([mol.get_positions()], dtype=torch.float32, requires_grad=check_grad, device=device)
-        cell = torch.tensor(mol.get_cell(complete=True), dtype=torch.float32, device=device)
-        pbc = torch.tensor(mol.get_pbc(), dtype=torch.bool, device=device)
-        if pbc[0] is False or not parser.use_pbc:
-            pbc = None
-            cell = None
-        print(f'File: {file}, Molecule size: {species.shape[-1]}\n')
-        print(f'cell: {cell}')
-        print(f'pbc: {pbc}')
+        run(file, nnp_ref, nnp_cuaev, nnpops_computer, runbackward=False)
+    # for maxatom in [6000, 10000, 13000]:
+    for maxatom in [6000, 10000]:
+        file = '1C17.pdb'
+        run(file, nnp_ref, nnp_cuaev, nnpops_computer, runbackward=False, maxatoms=maxatom)
 
-        nnp = torchani.models.ANI2x(periodic_table_index=True, model_index=None).to(device)
-        symmFuncRef = nnp.aev_computer
-        symmFuncRef.use_cuda_extension = False
-        symmFunc = TorchANISymmetryFunctions(nnp.aev_computer).to(device)
+    addSummaryEmptyLine()
+    info('Add Backward\n')
 
-        N = 200
+    for file in files:
+        run(file, nnp_ref, nnp_cuaev, nnpops_computer, runbackward=True)
+    for maxatom in [6000, 10000]:
+        file = '1C17.pdb'
+        run(file, nnp_ref, nnp_cuaev, nnpops_computer, runbackward=True, maxatoms=maxatom)
+    addSummaryEmptyLine()
 
-        print('Original TorchANI:')
-        aev_ref, delta_ref, grad_ref = benchmark(species, positions, cell, pbc, symmFuncRef, N, check_gpu_mem, check_grad, check_energy)
-        print()
-
-        print('NNPops:')
-        aev, delta, grad = benchmark(species, positions, cell, pbc, symmFunc, N, check_gpu_mem, check_grad, check_energy)
-        check_speedup_error(aev, aev_ref, delta, delta_ref, grad, grad_ref)
-
-        if (not parser.use_pbc):
-            print('CUaev (Kamesh):')
-            nnp.aev_computer.use_cuda_extension = True
-            cuaev_computer = nnp.aev_computer
-            aev, delta, grad = benchmark(species, positions, cell, pbc, cuaev_computer, N, check_gpu_mem, check_grad, check_energy)
-            check_speedup_error(aev, aev_ref, delta, delta_ref, grad, grad_ref)
-
-        print('-' * 70 + '\n')
+    print(summary)
+    if args.nsight:
+        torch.cuda.profiler.stop()
