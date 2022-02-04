@@ -1,4 +1,4 @@
-# Benchmark of Torchani
+# Benchmark of TorchANI for 20k ethanol
 
 ## Setup
 ```
@@ -22,3 +22,6 @@ device: cpu , energy+force : 16.180 seconds
 device: cuda, energy       : 0.711 seconds
 device: cuda, energy+force : 0.831 seconds
 ```
+
+
+Ref: [Permutationally invariant polynomial regression for energies and gradients, using reverse differentiation, achieves orders of magnitude speed-up with high precision compared to other machine learning methods: The Journal of Chemical Physics: Vol 156, No 4](https://aip.scitation.org/doi/suppl/10.1063/5.0080506)
